@@ -1,0 +1,377 @@
+import os
+import logging
+import sys
+from typing import Dict, List, Any, Optional
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import uvicorn
+import mlflow
+from mlflow.tracking import MlflowClient
+
+# Set up logging
+logging.basicConfig(
+    stream=sys.stdout,
+    format="%(asctime)s,%(msecs)03d %(name)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.DEBUG,
+)
+logger = logging.getLogger(__name__)
+
+# Create FastAPI app
+app = FastAPI(title="Model Inference Service")
+
+# Model configuration
+DEFAULT_MODEL_NAME = os.environ.get("MODEL_NAME", None)
+DEFAULT_MODEL_VERSION = os.environ.get("MODEL_VERSION", None)
+MLFLOW_TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "https://ard-mlflow.slac.stanford.edu")
+
+# Set MLflow tracking URI
+mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+
+# Global variable to store the model
+model = None
+current_model_name = None
+current_model_version = None
+
+
+# Request/Response models
+class PredictionRequest(BaseModel):
+    inputs: Dict[str, float]
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "inputs": {
+                    "input1": 1.0,
+                    "input2": 2.5
+                }
+            }
+        }
+
+
+class PredictionResponse(BaseModel):
+    outputs: Dict[str, float]
+
+
+class ModelInputsResponse(BaseModel):
+    input_names: List[str]
+    input_variables: Dict[str, Any]
+
+
+class LoadModelRequest(BaseModel):
+    model_name: str
+    model_version: Optional[str] = None
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "model_name": "my_accelerator_model",
+                "model_version": "1"
+            }
+        }
+
+
+class ModelInfo(BaseModel):
+    loaded: bool
+    model_name: Optional[str] = None
+    model_version: Optional[str] = None
+    model_uri: Optional[str] = None
+    input_names: Optional[List[str]] = None
+    output_names: Optional[List[str]] = None
+
+
+def get_model_uri(model_name: str, model_version: Optional[str] = None) -> str:
+    """
+    Get the MLflow model URI for loading
+    
+    Parameters
+    ----------
+    model_name : str
+        Name of the registered model in MLflow
+    model_version : str, optional
+        Can be:
+        - A specific version number (e.g., "1", "2")
+        - A stage name (e.g., "Production", "Staging")
+        - "latest" for the latest version
+        - None (defaults to "latest")
+    
+    Returns
+    -------
+    str
+        The MLflow model URI
+    """
+    client = MlflowClient()
+    
+    if model_version is None or model_version.lower() == "latest":
+        # Get the latest version
+        latest_versions = client.get_latest_versions(model_name, stages=None)
+        if not latest_versions:
+            raise ValueError(f"No versions found for model '{model_name}'")
+        version = latest_versions[0].version
+        model_uri = f"models:/{model_name}/{version}"
+        logger.info(f"Using latest version: {version}")
+    
+    elif model_version.isdigit():
+        # Specific version number
+        model_uri = f"models:/{model_name}/{model_version}"
+        logger.info(f"Using version: {model_version}")
+    
+    else:
+        # Stage name (Production, Staging, etc.)
+        model_uri = f"models:/{model_name}/{model_version}"
+        logger.info(f"Using stage: {model_version}")
+    
+    return model_uri
+
+
+def load_model_from_mlflow(model_name: str, model_version: Optional[str] = None):
+    """
+    Load a model from MLflow registry
+    
+    This function handles loading LUME models or generic PyFunc models.
+    """
+    global model, current_model_name, current_model_version
+    
+    try:
+        # Get the model URI
+        model_uri = get_model_uri(model_name, model_version)
+        
+        logger.info(f"Loading model from MLflow: {model_uri}")
+        
+        # Try to load as PyFunc (works for all MLflow models)
+        loaded_model = mlflow.pyfunc.load_model(model_uri)
+        
+        # If it's a LUME model, unwrap it
+        # LUME models are typically wrapped in a PyFunc wrapper
+        if hasattr(loaded_model, '_model_impl'):
+            # Check if the underlying model is a LUME model
+            underlying_model = loaded_model._model_impl
+            if hasattr(underlying_model, 'python_model'):
+                # This is likely a custom LUME model
+                model = underlying_model.python_model
+                logger.info("Loaded as LUME model")
+            else:
+                model = loaded_model
+                logger.info("Loaded as PyFunc model")
+        else:
+            model = loaded_model
+            logger.info("Loaded as standard MLflow model")
+        
+        current_model_name = model_name
+        current_model_version = model_version
+        
+        logger.info(f" Model loaded successfully!")
+        logger.info(f"  Model name: {current_model_name}")
+        logger.info(f"  Model version: {current_model_version}")
+        logger.info(f"  Model URI: {model_uri}")
+        
+        # Log model details if available
+        if hasattr(model, 'input_names'):
+            logger.info(f"  Input variables: {model.input_names}")
+        if hasattr(model, 'output_names'):
+            logger.info(f"  Output variables: {model.output_names}")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"✗ Failed to load model: {str(e)}", exc_info=True)
+        raise
+
+
+@app.on_event("startup")
+async def startup():
+    """Load default model on startup if specified"""
+    logger.info(f"MLflow Tracking URI: {MLFLOW_TRACKING_URI}")
+    
+    if DEFAULT_MODEL_NAME:
+        try:
+            load_model_from_mlflow(DEFAULT_MODEL_NAME, DEFAULT_MODEL_VERSION)
+        except Exception as e:
+            logger.warning(f"Could not load default model on startup: {str(e)}")
+            logger.warning("Service will start without a loaded model. Use POST /model/load to load a model.")
+    else:
+        logger.info("No default model specified. Use POST /model/load to load a model.")
+
+
+@app.get("/")
+async def root():
+    """Root endpoint with service info"""
+    return {
+        "service": "Model Inference Service",
+        "mlflow_tracking_uri": MLFLOW_TRACKING_URI,
+        "model_loaded": model is not None,
+        "current_model": {
+            "name": current_model_name,
+            "version": current_model_version
+        } if model else None,
+        "endpoints": {
+            "health": "/health",
+            "model_info": "/model/info",
+            "load_model": "POST /model/load",
+            "model_inputs": "/inputs",
+            "predict": "/predict"
+        }
+    }
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for Kubernetes probes"""
+    return {
+        "status": "healthy",
+        "model_loaded": model is not None,
+        "model_name": current_model_name,
+        "model_version": current_model_version
+    }
+
+
+@app.get("/model/info", response_model=ModelInfo)
+async def get_model_info():
+    """Get information about the currently loaded model"""
+    if model is None:
+        return ModelInfo(loaded=False)
+    
+    model_uri = get_model_uri(current_model_name, current_model_version) if current_model_name else None
+    
+    return ModelInfo(
+        loaded=True,
+        model_name=current_model_name,
+        model_version=current_model_version,
+        model_uri=model_uri,
+        input_names=model.input_names if hasattr(model, 'input_names') else None,
+        output_names=model.output_names if hasattr(model, 'output_names') else None
+    )
+
+
+@app.post("/model/load")
+async def load_model(request: LoadModelRequest):
+    """
+    Load a new model from MLflow
+    
+    This allows you to dynamically switch models without restarting the service.
+    """
+    try:
+        load_model_from_mlflow(request.model_name, request.model_version)
+        
+        return {
+            "status": "success",
+            "message": f"Model '{request.model_name}' version '{request.model_version}' loaded successfully",
+            "model_name": current_model_name,
+            "model_version": current_model_version,
+            "input_names": model.input_names if hasattr(model, 'input_names') else None,
+            "output_names": model.output_names if hasattr(model, 'output_names') else None
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load model: {str(e)}")
+
+
+@app.get("/inputs", response_model=ModelInputsResponse)
+async def get_model_inputs():
+    """Get information about model inputs"""
+    if model is None:
+        raise HTTPException(
+            status_code=503, 
+            detail="No model loaded. Use POST /model/load to load a model first."
+        )
+    
+    if not hasattr(model, 'input_variables'):
+        raise HTTPException(
+            status_code=500,
+            detail="Model does not expose input_variables. This may not be a LUME model."
+        )
+    
+    # Extract input variable info
+    input_variables = {}
+    for name, var in model.input_variables.items():
+        input_variables[name] = {
+            "default": var.default if hasattr(var, 'default') else None,
+            "range": var.value_range if hasattr(var, 'value_range') else None,
+            "units": var.units if hasattr(var, 'units') else None,
+        }
+    
+    return ModelInputsResponse(
+        input_names=model.input_names,
+        input_variables=input_variables
+    )
+
+
+@app.post("/predict", response_model=PredictionResponse)
+async def predict(request: PredictionRequest):
+    """
+    Run model inference
+    
+    Takes a dictionary of inputs and returns model predictions.
+    """
+    if model is None:
+        raise HTTPException(
+            status_code=503, 
+            detail="No model loaded. Use POST /model/load to load a model first."
+        )
+    
+    try:
+        logger.debug(f"Received prediction request: {request.inputs}")
+        
+        # Handle LUME models
+        if hasattr(model, 'evaluate'):
+            # Set input validation to warn (not fail)
+            if hasattr(model, 'input_validation_config'):
+                model.input_validation_config = {k: "warn" for k in model.input_names}
+            
+            # Run the LUME model
+            outputs = model.evaluate(request.inputs)
+        
+        # Handle generic PyFunc models
+        elif hasattr(model, 'predict'):
+            import pandas as pd
+            # Convert inputs to DataFrame for PyFunc models
+            input_df = pd.DataFrame([request.inputs])
+            outputs = model.predict(input_df)
+            
+            # Convert output to dict if it's an array/series
+            if hasattr(outputs, 'to_dict'):
+                outputs = outputs.to_dict('records')[0]
+            elif isinstance(outputs, (list, tuple)):
+                outputs = {f"output_{i}": v for i, v in enumerate(outputs)}
+        
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail="Model does not have 'evaluate' or 'predict' method"
+            )
+        
+        # Clean outputs (convert torch tensors, numpy arrays to Python floats)
+        cleaned_outputs = {}
+        for k, v in outputs.items():
+            try:
+                import torch
+                if isinstance(v, torch.Tensor):
+                    cleaned_outputs[k] = float(v.detach().cpu().numpy())
+                else:
+                    cleaned_outputs[k] = float(v)
+            except (ImportError, AttributeError):
+                try:
+                    import numpy as np
+                    if isinstance(v, np.ndarray):
+                        cleaned_outputs[k] = float(v)
+                    else:
+                        cleaned_outputs[k] = float(v)
+                except ImportError:
+                    cleaned_outputs[k] = float(v)
+        
+        logger.debug(f"Prediction result: {cleaned_outputs}")
+        
+        return PredictionResponse(outputs=cleaned_outputs)
+    
+    except Exception as e:
+        logger.error(f"Prediction error: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
+
+
+if __name__ == "__main__":
+    # Run the service
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        log_level="info"
+    )
